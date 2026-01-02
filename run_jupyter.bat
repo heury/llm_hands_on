@@ -1,1 +1,1 @@
-uv run jupyter lab
+jupyter lab
