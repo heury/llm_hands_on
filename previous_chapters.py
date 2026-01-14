@@ -446,29 +446,26 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.train()
     return train_loss, val_loss
 
+
+# ==========================================
+# 모델 다운로드
+# ==========================================
+def download_model(file_name, model_path):
+    url = f"https://huggingface.co/rasbt/gpt2-from-scratch-pytorch/resolve/main/{file_name}"
+
+    if not os.path.exists(model_path):
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        with open(model_path, "wb") as f:
+            f.write(response.content)
+        print(f"Downloaded to {model_path}")
+
 def load_gpt2_model(file_name, config, device="cpu"):
     """
     GPT2 가중치를 다운로드하고 모델에 로드하는 함수
     """
-    # 1. 경로 설정
-    base_dir = "models/gpt2"
-    os.makedirs(base_dir, exist_ok=True)  # 폴더가 없으면 생성
-    model_path = os.path.join(base_dir, file_name)
-    
-    url = f"https://huggingface.co/rasbt/gpt2-from-scratch-pytorch/resolve/main/{file_name}"
-
-    # 2. 파일 다운로드 (파일이 없을 때만 실행)
-    if not os.path.exists(model_path):
-        print(f"'{file_name}' 다운로드 중...")
-        with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            with open(model_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        print(f"다운로드 완료: {model_path}")
-    else:
-        print(f"이미 파일이 존재합니다: {model_path}")
-
+    model_path = f"./models/gpt2/{file_name}"
+    download_model(file_name, model_path)
     # 3. 모델 초기화 및 가중치 로드
     model = GPTModel(config)
     # map_location을 통해 CPU/GPU 환경 대응
@@ -482,7 +479,6 @@ def load_gpt2_model(file_name, config, device="cpu"):
 #####################################
 # Chapter 6
 #####################################
-
 
 def download_and_unzip_spam_data(url, zip_path, extracted_path, data_file_path):
     if data_file_path.exists():
@@ -651,43 +647,6 @@ def train_classifier_simple(model, train_loader, val_loader, optimizer, device, 
 
     return train_losses, val_losses, train_accs, val_accs, examples_seen
 
-# Overall the same as `train_model_simple` in chapter 5
-def train_classifier_lora(model, train_loader, val_loader, optimizer, device, num_epochs,
-                            eval_freq, eval_iter):
-    # Initialize lists to track losses and tokens seen
-    train_losses, val_losses, train_accs, val_accs = [], [], [], []
-    examples_seen, global_step = 0, -1
-
-    # Main training loop
-    for epoch in range(num_epochs):
-        model.train()  # Set model to training mode
-
-        for input_batch, target_batch in train_loader:
-            optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
-            loss = calc_loss_batch_lora(input_batch, target_batch, model, device)
-            loss.backward()  # Calculate loss gradients
-            optimizer.step()  # Update model weights using loss gradients
-            examples_seen += input_batch.shape[0]  # New: track examples instead of tokens
-            global_step += 1
-
-            # Optional evaluation step
-            if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, eval_iter)
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                print(f"Ep {epoch+1} (Step {global_step:06d}): "
-                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-
-        # Calculate accuracy after each epoch
-        train_accuracy = calc_accuracy_loader(train_loader, model, device, num_batches=eval_iter)
-        val_accuracy = calc_accuracy_loader(val_loader, model, device, num_batches=eval_iter)
-        print(f"Training accuracy: {train_accuracy*100:.2f}% | ", end="")
-        print(f"Validation accuracy: {val_accuracy*100:.2f}%")
-        train_accs.append(train_accuracy)
-        val_accs.append(val_accuracy)
-
-    return train_losses, val_losses, train_accs, val_accs, examples_seen
 
 def plot_values(epochs_seen, examples_seen, train_values, val_values, label="loss"):
     fig, ax1 = plt.subplots(figsize=(5, 3))
