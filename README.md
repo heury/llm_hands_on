@@ -1,5 +1,5 @@
 ## 교재
-- [pdf/AI-Application-Specialist-LLM-20260103.pdf](AI-Application-Specialist-LLM-20260103.pdf)
+- [AI-Application-Specialist-LLM-20260103.pdf](pdf/AI-Application-Specialist-LLM-20260103.pdf)
   
 ## 챕터별 실습 노트북
 
