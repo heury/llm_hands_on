@@ -10,3 +10,4 @@ __pycache__
 .env
 .DS_Store
 unsloth_compiled_cache
+logs/
