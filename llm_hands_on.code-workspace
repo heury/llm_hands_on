@@ -1,0 +1,21 @@
+{
+	"folders": [
+		{
+			"name": "llm_hands_on",
+			"path": "."
+		},
+		{
+			"name": "llm_lecture",
+			"path": "../llm_lecture"
+		},
+		{
+			"name": "llm_extending",
+			"path": "../llm_extending"
+		},
+		{
+			"name": "GPU A100",
+			"uri": "colab://gpu-a100-s-2ya5eujk0k4km/"
+		}
+	],
+	"settings": {}
+}
