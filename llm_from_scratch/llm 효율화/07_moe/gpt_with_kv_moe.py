@@ -156,6 +156,93 @@ class FeedForward(nn.Module):
         return self.layers(x)
 
 
+#####################################
+# Mixture of Experts (MoE) FeedForward
+#####################################
+# MoE는 하나의 큰 FFN 대신 여러 개의 작은 Expert 중 일부만 선택하여 연산합니다.
+#
+# ============================================
+# Dense FFN vs MoE FFN 비교
+# ============================================
+#
+# Dense FFN:
+#   입력 → [하나의 큰 FFN] → 출력
+#   모든 토큰이 같은 파라미터 사용
+#
+# MoE FFN:
+#   입력 → Gate → [Expert 1, 2, ..., N] 중 Top-K 선택 → 가중합 출력
+#   토큰마다 다른 Expert 조합 사용
+#
+# ============================================
+# 구조
+# ============================================
+#
+#         입력 x (768)
+#              │
+#    ┌─────────┴─────────┐
+#    │                   │
+#    ▼                   ▼
+# [Gate Network]    [Expert 1] [Expert 2] ... [Expert N]
+# 768 → N scores       │           │              │
+#    │                 └───────────┴──────────────┘
+#    ▼                              │
+# Top-K 선택 ──────────────────────►│
+# (예: K=2)                         │
+#    │                              ▼
+#    └────► 선택된 Expert만 연산 후 가중합 → 출력
+#
+# ============================================
+# 핵심 코드 설명
+# ============================================
+#
+# 1. Gate Network:
+#    self.gate = nn.Linear(emb_dim, num_experts)
+#    - 입력을 보고 각 Expert의 점수 계산
+#    - scores = gate(x)  # (batch, seq, num_experts)
+#
+# 2. Top-K 선택:
+#    topk_scores, topk_indices = torch.topk(scores, num_experts_per_tok)
+#    topk_probs = softmax(topk_scores)  # 선택된 Expert들의 가중치
+#
+# 3. Expert (SwiGLU 구조):
+#    fc1, fc2: emb_dim → hidden_dim (병렬 투영)
+#    fc3: hidden_dim → emb_dim
+#    hidden = silu(fc1(x)) * fc2(x)  # 게이트 메커니즘
+#    output = fc3(hidden)
+#
+# 4. 가중합:
+#    output = Σ (prob_i × Expert_i(x))
+#
+# ============================================
+# 예시 (num_experts=8, num_experts_per_tok=2)
+# ============================================
+#
+# 토큰 "cat":
+#   Gate 점수: [0.1, 0.3, 0.05, 0.8, 0.2, 0.15, 0.7, 0.1]
+#   Top-2 선택: Expert 3 (0.8), Expert 6 (0.7)
+#   softmax([0.8, 0.7]) = [0.52, 0.48]
+#   출력 = 0.52 × Expert3(x) + 0.48 × Expert6(x)
+#
+# ============================================
+# 메모리 vs 연산량 Trade-off
+# ============================================
+#
+# | 항목          | Dense FFN | MoE (8 Expert, Top-2) |
+# |---------------|-----------|----------------------|
+# | 파라미터 수   | 1×        | 8× (Expert 수)       |
+# | 실제 연산량   | 100%      | 25% (2/8)            |
+# | 모델 용량     | 고정      | 대폭 증가            |
+#
+# → 파라미터는 8배 늘려도, 연산량은 2배만 증가!
+# → 더 큰 모델 용량을 적은 연산 비용으로 달성
+#
+# ============================================
+# 사용처
+# ============================================
+# - Mixtral 8x7B: 8 Expert, Top-2
+# - GPT-4 (추정): MoE 구조 사용
+# - Switch Transformer: Top-1 Expert
+#
 class MoEFeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -163,7 +250,9 @@ class MoEFeedForward(nn.Module):
         self.num_experts = cfg["num_experts"]
         self.emb_dim = cfg["emb_dim"]
 
+        # Gate: 입력을 보고 어떤 Expert를 사용할지 점수 계산
         self.gate = nn.Linear(cfg["emb_dim"], cfg["num_experts"], bias=False)
+        # fc1, fc2, fc3: 각 Expert의 SwiGLU FFN (Expert마다 독립적인 파라미터)
         self.fc1 = nn.ModuleList(
             [
                 nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], bias=False)
@@ -185,43 +274,73 @@ class MoEFeedForward(nn.Module):
 
     def forward(self, x):
         # x: (batch, seq_len, emb_dim)
-        scores = self.gate(x)  # (b, seq_len, num_experts)
-        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
-        topk_probs = torch.softmax(topk_scores, dim=-1)
 
+        ####################################################
+        # Step 1: Gate 점수 계산 및 Top-K Expert 선택
+        ####################################################
+        scores = self.gate(x)  # (batch, seq_len, num_experts)
+        # 각 토큰에 대해 가장 점수가 높은 K개의 Expert 선택
+        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        # 선택된 Expert들의 가중치 계산 (합=1)
+        topk_probs = torch.softmax(topk_scores, dim=-1)
+        # 예: num_experts=8, num_experts_per_tok=2
+        # topk_indices = [[3, 6], [1, 4], ...]  # 각 토큰이 선택한 Expert ID
+        # topk_probs = [[0.52, 0.48], [0.61, 0.39], ...]  # 가중치
+
+        ####################################################
+        # Step 2: 토큰을 평탄화하여 배치 처리 준비
+        ####################################################
         batch, seq_len, _ = x.shape
-        x_flat = x.reshape(batch * seq_len, -1)
+        x_flat = x.reshape(batch * seq_len, -1)  # (batch*seq_len, emb_dim)
         out_flat = torch.zeros(batch * seq_len, self.emb_dim, device=x.device, dtype=x.dtype)
 
         topk_indices_flat = topk_indices.reshape(-1, self.num_experts_per_tok)
         topk_probs_flat = topk_probs.reshape(-1, self.num_experts_per_tok)
 
+        # 실제로 선택된 Expert들만 처리 (Sparse Computation)
         unique_experts = torch.unique(topk_indices_flat)
 
+        ####################################################
+        # Step 3: 각 Expert별로 해당 토큰들만 모아서 처리
+        ####################################################
         for expert_id_tensor in unique_experts:
             expert_id = int(expert_id_tensor.item())
 
+            # 이 Expert가 선택된 토큰 위치 찾기
             mask = topk_indices_flat == expert_id
             if not mask.any():
                 continue
 
+            # 이 Expert를 사용하는 토큰들의 인덱스
             token_mask = mask.any(dim=-1)
             selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
             if selected_idx.numel() == 0:
                 continue
 
+            ####################################################
+            # Step 4: SwiGLU Expert 연산
+            ####################################################
+            # 선택된 토큰들만 추출
             expert_input = x_flat.index_select(0, selected_idx)
+            # SwiGLU: silu(fc1(x)) * fc2(x) → fc3
+            # silu = x * sigmoid(x) (Swish 활성화 함수)
             hidden = torch.nn.functional.silu(self.fc1[expert_id](expert_input)) * self.fc2[
                 expert_id
             ](expert_input)
             expert_out = self.fc3[expert_id](hidden)
 
+            ####################################################
+            # Step 5: 가중치를 곱해서 결과에 누적
+            ####################################################
+            # 이 Expert의 가중치 추출
             mask_selected = mask[selected_idx]
             slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
             selected_probs = torch.gather(
                 topk_probs_flat.index_select(0, selected_idx), dim=-1, index=slot_indices
             ).squeeze(-1)
 
+            # 가중치를 곱한 결과를 누적 (여러 Expert 결과의 가중합)
+            # 예: 토큰 "cat"의 출력 = 0.52 × Expert3(x) + 0.48 × Expert6(x)
             out_flat.index_add_(0, selected_idx, expert_out * selected_probs.unsqueeze(-1))
 
         return out_flat.reshape(batch, seq_len, self.emb_dim)

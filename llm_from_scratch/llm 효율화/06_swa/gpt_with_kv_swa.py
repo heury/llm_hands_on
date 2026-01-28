@@ -15,8 +15,113 @@ import torch.nn as nn
 
 
 #####################################
-# Chapter 3
+# Sliding Window Attention (SWA)
 #####################################
+# SWA는 고정된 윈도우 크기 내의 토큰만 참조하여 메모리와 연산량을 줄이는 어텐션 기법입니다.
+# Mistral, Gemma 2 등에서 사용됩니다.
+#
+# ============================================
+# 일반 Attention vs Sliding Window Attention
+# ============================================
+#
+# 일반 Causal Attention (모든 이전 토큰 참조):
+# 토큰:    T0  T1  T2  T3  T4  T5  T6  T7
+# T7 참조: ✓   ✓   ✓   ✓   ✓   ✓   ✓   ✓  (모두 참조)
+#
+# Sliding Window Attention (윈도우=4):
+# 토큰:    T0  T1  T2  T3  T4  T5  T6  T7
+# T7 참조: ✗   ✗   ✗   ✗   ✓   ✓   ✓   ✓  (최근 4개만 참조)
+#          └─ 윈도우 밖 ─┘  └─ 윈도우 안 ─┘
+#
+# ============================================
+# 핵심 코드
+# ============================================
+#
+# 1. KV 캐시 트리밍 (윈도우 크기 초과 시 오래된 것 삭제):
+#    if self.sliding_window_size is not None:
+#        if self.cache_k.size(1) > self.sliding_window_size:
+#            self.cache_k = self.cache_k[:, -self.sliding_window_size:, :, :]
+#            self.cache_v = self.cache_v[:, -self.sliding_window_size:, :, :]
+#
+#    캐시 (윈도우=4):
+#    Before: [K0, K1, K2, K3, K4, K5]  (6개)
+#    After:  [K2, K3, K4, K5]          (최근 4개만 유지)
+#
+# 2. 슬라이딩 윈도우 마스크:
+#    W = self.sliding_window_size  # 윈도우 크기
+#    diff = q_positions - k_positions
+#    mask_bool = (diff < 0) | (diff >= W)  # 윈도우 밖이면 마스킹
+#
+#    | 조건       | 의미                    |
+#    |------------|-------------------------|
+#    | diff < 0   | 미래 토큰 (causal mask) |
+#    | diff >= W  | 윈도우 밖의 과거 토큰   |
+#
+# ============================================
+# K:1 스케줄링
+# ============================================
+# 모든 레이어에 SWA를 적용하지 않고, K개 SWA + 1개 일반 어텐션 패턴을 반복합니다.
+#
+# sliding_window_stride = 2 인 경우 (2:1 스케줄):
+# Layer 0: SWA
+# Layer 1: SWA
+# Layer 2: 일반 (전체 참조)
+# Layer 3: SWA
+# Layer 4: SWA
+# Layer 5: 일반 (전체 참조)
+# ...
+#
+# 이유: 일부 레이어에서 전체 컨텍스트를 참조하여 정보 손실 방지.
+#
+# ============================================
+# 메모리 절약 효과
+# ============================================
+# | 항목           | 일반 Attention  | SWA (윈도우=1024) |
+# |----------------|-----------------|-------------------|
+# | KV 캐시 크기   | O(시퀀스 길이)  | O(윈도우 크기) = 고정 |
+# | 어텐션 연산    | O(n²)           | O(n × W)          |
+#
+# 시퀀스가 아무리 길어져도 KV 캐시는 윈도우 크기로 고정됩니다.
+#
+# ============================================
+# 시각화
+# ============================================
+# 일반 Attention (모든 이전 토큰):
+#         K0 K1 K2 K3 K4 K5 K6 K7
+#    Q7 [  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓ ]  ← 8개 참조
+#
+# Sliding Window (W=4):
+#         K0 K1 K2 K3 K4 K5 K6 K7
+#    Q7 [  ✗  ✗  ✗  ✗  ✓  ✓  ✓  ✓ ]  ← 4개만 참조
+#          └─ 마스킹 ─┘
+#
+# Sliding Window + K:1 스케줄 (일부 레이어는 전체 참조):
+# Layer 0 (SWA):  Q7 → [K4, K5, K6, K7]  (윈도우 내)
+# Layer 1 (SWA):  Q7 → [K4, K5, K6, K7]  (윈도우 내)
+# Layer 2 (일반): Q7 → [K0~K7 전체]       (전체 컨텍스트)
+#
+# ============================================
+# 사용처
+# ============================================
+# | 모델        | 윈도우 크기 | 스케줄              |
+# |-------------|-------------|---------------------|
+# | Mistral 7B  | 4096        | 전체 SWA            |
+# | Gemma 2     | 4096        | 1:1 (SWA-일반 교대) |
+# | Phi-3       | 2048        | K:1 스케줄          |
+#
+# ============================================
+# Trade-off
+# ============================================
+# | 장점                      | 단점                      |
+# |---------------------------|---------------------------|
+# | KV 캐시 고정 크기         | 먼 토큰 직접 참조 불가    |
+# | 긴 시퀀스도 메모리 일정   | 일부 정보 손실 가능       |
+# | 추론 속도 향상            | K:1 스케줄 튜닝 필요      |
+#
+# SWA는 무한히 긴 시퀀스도 고정 메모리로 처리할 수 있어,
+# 스트리밍/실시간 생성에 효과적입니다.
+
+
 class MultiHeadAttentionWithSWA(nn.Module):
     def __init__(self, d_in, d_out, dropout, num_heads, qkv_bias=False, sliding_window_size=None):
         super().__init__()
@@ -54,25 +159,36 @@ class MultiHeadAttentionWithSWA(nn.Module):
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
 
         ####################################################
-        # KV cache-related
+        # KV 캐시 + 슬라이딩 윈도우 트리밍
+        ####################################################
         if use_cache:
+            # 이전 캐시 길이 저장
             old_len = 0 if self.cache_k is None else self.cache_k.size(1)
+
+            # 캐시에 새 K, V 추가
             if self.cache_k is None:
                 self.cache_k, self.cache_v = keys_new, values_new
             else:
                 self.cache_k = torch.cat([self.cache_k, keys_new], dim=1)
                 self.cache_v = torch.cat([self.cache_v, values_new], dim=1)
-            # Left-trim to sliding window if configured
+
+            ####################################################
+            # 슬라이딩 윈도우 트리밍 (핵심!)
+            # 캐시가 윈도우 크기를 초과하면 오래된 토큰 삭제
+            # 예: 윈도우=4, 캐시=[K0,K1,K2,K3,K4,K5] → [K2,K3,K4,K5]
+            ####################################################
             if self.sliding_window_size is not None:
                 if self.cache_k.size(1) > self.sliding_window_size:
                     self.cache_k = self.cache_k[:, -self.sliding_window_size:, :, :]
                     self.cache_v = self.cache_v[:, -self.sliding_window_size:, :, :]
-            # Compute absolute start positions for mask
-            total_len = old_len + num_tokens
-            k_len_now = self.cache_k.size(1)
-            dropped = max(0, total_len - k_len_now)
-            k_start_pos_abs = (self.ptr_current_pos - old_len) + dropped
-            q_start_pos_abs = self.ptr_current_pos
+
+            # 절대 위치 계산 (마스크 생성용)
+            # 트리밍으로 삭제된 토큰 수를 고려해야 함
+            total_len = old_len + num_tokens        # 원래 전체 길이
+            k_len_now = self.cache_k.size(1)        # 트리밍 후 캐시 길이
+            dropped = max(0, total_len - k_len_now) # 삭제된 토큰 수
+            k_start_pos_abs = (self.ptr_current_pos - old_len) + dropped  # K의 시작 절대 위치
+            q_start_pos_abs = self.ptr_current_pos  # Q의 시작 절대 위치
             keys, values = self.cache_k, self.cache_v
         else:
             keys, values = keys_new, values_new
@@ -87,23 +203,48 @@ class MultiHeadAttentionWithSWA(nn.Module):
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
         ####################################################
-        # causal + sliding-window mask
+        # Causal + Sliding Window 마스크 생성
+        ####################################################
         num_tokens_Q = queries.shape[-2]
         num_tokens_K = keys.shape[-2]
         device = queries.device
-        # Determine absolute positions for q and k
+
+        # Q와 K의 절대 위치 결정
         if use_cache:
             q_start = q_start_pos_abs
             k_start = k_start_pos_abs
         else:
             q_start = 0
             k_start = 0
+
+        # 절대 위치 배열 생성
+        # 예: q_start=7, num_tokens_Q=1 → q_positions=[7]
+        # 예: k_start=4, num_tokens_K=4 → k_positions=[4,5,6,7]
         q_positions = torch.arange(q_start, q_start + num_tokens_Q, device=device, dtype=torch.long)
         k_positions = torch.arange(k_start, k_start + num_tokens_K, device=device, dtype=torch.long)
-        # Sliding window width
+
+        # 슬라이딩 윈도우 크기 결정
+        # None이면 전체 참조 (일반 어텐션)
         W = num_tokens_K + 1 if self.sliding_window_size is None else int(self.sliding_window_size)
+
+        # 마스크 생성: Q위치 - K위치 = 거리
+        # diff[i,j] = q_positions[i] - k_positions[j]
         diff = q_positions.unsqueeze(-1) - k_positions.unsqueeze(0)
+
+        # 마스킹 조건:
+        # 1) diff < 0: 미래 토큰 (causal mask)
+        # 2) diff >= W: 윈도우 밖의 과거 토큰 (sliding window mask)
+        #
+        # 예: Q위치=7, K위치=[4,5,6,7], W=4
+        # diff = [7-4, 7-5, 7-6, 7-7] = [3, 2, 1, 0]
+        # mask = [False, False, False, False] (모두 윈도우 내)
+        #
+        # 예: Q위치=7, K위치=[0,1,2,3], W=4
+        # diff = [7-0, 7-1, 7-2, 7-3] = [7, 6, 5, 4]
+        # mask = [True, True, True, True] (모두 diff >= 4)
         mask_bool = (diff < 0) | (diff >= W)
+
+        # 위치 포인터 업데이트
         if use_cache:
             self.ptr_current_pos += num_tokens_Q
         else:
@@ -217,27 +358,44 @@ class GPTModel(nn.Module):
         self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
 
-        # self.trf_blocks = nn.Sequential(
-        #    *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         ####################################################
-        #  KV cache-related
+        # K:1 스케줄링으로 Transformer 블록 생성
+        ####################################################
+        # K:1 스케줄 = K개의 SWA 레이어 + 1개의 일반 어텐션 레이어 반복
+        #
+        # sliding_window_stride = 2 인 경우 (2:1 스케줄):
+        # Layer 0: SWA (i=0, 0 % 3 = 0 < 2 → SWA)
+        # Layer 1: SWA (i=1, 1 % 3 = 1 < 2 → SWA)
+        # Layer 2: 일반 (i=2, 2 % 3 = 2 >= 2 → 일반)
+        # Layer 3: SWA (i=3, 3 % 3 = 0 < 2 → SWA)
+        # Layer 4: SWA (i=4, 4 % 3 = 1 < 2 → SWA)
+        # Layer 5: 일반 (i=5, 5 % 3 = 2 >= 2 → 일반)
+        # ...
+        #
+        # 이유: 일부 레이어에서 전체 컨텍스트를 참조하여 정보 손실 방지
+        ####################################################
         blocks = []
         window_stride = cfg["sliding_window_stride"]
         window_size = cfg["sliding_window_size"] if "sliding_window_size" in cfg else None
+
         for i in range(cfg["n_layers"]):
             blk = TransformerBlock(cfg)
-            # K:1 schedule meaning that K SWA layers are followed by 1 regular layer
+
             K = int(window_stride)
             if K <= 0:
-                # 0 => all regular; negative => all SWA
+                # K=0: 모든 레이어가 일반 어텐션
+                # K<0: 모든 레이어가 SWA
                 use_swa = False if K == 0 else True
             else:
-                group = K + 1
-                use_swa = (i % group) < K
+                # K:1 스케줄 적용
+                group = K + 1              # 그룹 크기 (예: 2+1=3)
+                use_swa = (i % group) < K  # 그룹 내 처음 K개는 SWA
+
+            # SWA 레이어면 윈도우 크기 설정, 아니면 None (전체 참조)
             blk.att.sliding_window_size = window_size if use_swa else None
             blocks.append(blk)
-        self.trf_blocks = nn.ModuleList(blocks)
 
+        self.trf_blocks = nn.ModuleList(blocks)
         self.current_pos = 0
         ####################################################
 

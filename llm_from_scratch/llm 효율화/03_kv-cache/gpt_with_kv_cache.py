@@ -32,7 +32,7 @@ class MultiHeadAttention(nn.Module):
         )
 
         ####################################################
-        # NEW
+        # 캐시 등록
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
         self.ptr_current_pos = 0
@@ -52,7 +52,7 @@ class MultiHeadAttention(nn.Module):
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
 
         ####################################################
-        # NEW
+        # 캐시 적용
         if use_cache:
             if self.cache_k is None:
                 self.cache_k, self.cache_v = keys_new, values_new
@@ -73,10 +73,37 @@ class MultiHeadAttention(nn.Module):
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
         ####################################################
-        # NEW
+        # mask 적용
         num_tokens_Q = queries.shape[-2]
         num_tokens_K = keys.shape[-2]
+
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 0 ptr_current_pos + num_tokens_Q 4 num_tokens_Q 4 num_tokens_K 4
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 4 ptr_current_pos + num_tokens_Q 5 num_tokens_Q 1 num_tokens_K 5
+        # ptr_current_pos 5 ptr_current_pos + num_tokens_Q 6 num_tokens_Q 1 num_tokens_K 6
         if use_cache:
+            print("ptr_current_pos",self.ptr_current_pos,"ptr_current_pos + num_tokens_Q",self.ptr_current_pos + num_tokens_Q,"num_tokens_Q",num_tokens_Q, "num_tokens_K",num_tokens_K)
             mask_bool = self.mask.bool()[
                 self.ptr_current_pos:self.ptr_current_pos + num_tokens_Q, :num_tokens_K
             ]
@@ -217,7 +244,11 @@ class GPTModel(nn.Module):
 
         ####################################################
         # NEW
-
+        # 단계	seq_len	current_pos	pos_ids	설명
+        # 프롬프트	4	0 → 4	[0,1,2,3]	"Hello, I am"
+        # 1번째 생성	1	4 → 5	[4]	5번째 토큰
+        # 2번째 생성	1	5 → 6	[5]	6번째 토큰
+        # 3번째 생성	1	6 → 7	[6]	7번째 토큰
         if use_cache:
             pos_ids = torch.arange(self.current_pos, self.current_pos + seq_len, device=in_idx.device, dtype=torch.long)
             self.current_pos += seq_len
@@ -277,6 +308,38 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 
 ####################################################
 # NEW
+# ┌─────────────────────────────────────────────────────────┐
+# │ 1단계: 프롬프트 처리                                      │
+# ├─────────────────────────────────────────────────────────┤
+# │ 입력: [Hello, ,, I, am]  →  모델  →  logits (4, vocab)  │
+# │                              ↓                          │
+# │                         캐시에 K,V 저장                  │
+# └─────────────────────────────────────────────────────────┘
+#                               ↓
+# ┌─────────────────────────────────────────────────────────┐
+# │ 2단계: 첫 번째 토큰 생성                                  │
+# ├─────────────────────────────────────────────────────────┤
+# │ logits[:, -1] → argmax → "a"                            │
+# │ 입력: ["a"]  →  모델(캐시 사용)  →  logits (1, vocab)    │
+# └─────────────────────────────────────────────────────────┘
+#                               ↓
+# ┌─────────────────────────────────────────────────────────┐
+# │ 3단계: 두 번째 토큰 생성                                  │
+# ├─────────────────────────────────────────────────────────┤
+# │ logits[:, -1] → argmax → "very"                         │
+# │ 입력: ["very"]  →  모델(캐시 사용)  →  logits (1, vocab) │
+# └─────────────────────────────────────────────────────────┘
+#                               ↓
+#                             ...
+
+# 캐시 사용 vs 미사용 비교
+# 항목|캐시 사용|캐시 미사용
+# 모델 입력|새 토큰 1개|전체 시퀀스
+# K,V 계산|새 토큰만|매번 전체 재계산
+# 복잡도|O(n)|O(n²)
+# 메모리|캐시 저장 필요|추가 메모리 없음
+
+
 def generate_text_simple_cached(model, idx, max_new_tokens,
                                 context_size=None, use_cache=True):
     model.eval()

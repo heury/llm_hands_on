@@ -15,8 +15,76 @@ import torch.nn as nn
 
 
 #####################################
-# NEW: GQA instead of MHA
+# Grouped Query Attention (GQA)
 #####################################
+# GQA는 K/V 헤드 수를 줄여 메모리와 연산량을 절약하는 어텐션 기법입니다.
+# Llama 2, Mistral 등에서 사용됩니다.
+#
+# ============================================
+# MHA vs GQA vs MQA 비교
+# ============================================
+#
+# MHA (Multi-Head Attention):        GQA (Grouped Query):           MQA (Multi-Query):
+# Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8           Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8        Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8
+#  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓            ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓         ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓
+# K1 K2 K3 K4 K5 K6 K7 K8           K1 K1 K1 K1 K2 K2 K2 K2        K1 K1 K1 K1 K1 K1 K1 K1
+# V1 V2 V3 V4 V5 V6 V7 V8           V1 V1 V1 V1 V2 V2 V2 V2        V1 V1 V1 V1 V1 V1 V1 V1
+#    8 Q, 8 K, 8 V                     8 Q, 2 K, 2 V (그룹=2)          8 Q, 1 K, 1 V
+#
+# ============================================
+# 핵심 코드
+# ============================================
+#
+# 1. K/V 프로젝션 크기 축소:
+#    MHA: 768 → 768 (12헤드 × 64)
+#    GQA: 768 → 128 (2그룹 × 64)
+#    self.W_key = nn.Linear(d_in, num_kv_groups * self.head_dim)   # 768 → 128
+#    self.W_value = nn.Linear(d_in, num_kv_groups * self.head_dim) # 768 → 128
+#    self.group_size = num_heads // num_kv_groups  # 12 // 2 = 6
+#
+# 2. Reshape - 그룹 수만큼만:
+#    Query: 전체 12헤드
+#    queries = queries.view(b, num_tokens, 12, 64).transpose(1, 2)
+#    Key/Value: 2그룹만
+#    keys_new = keys.view(b, num_tokens, 2, 64).transpose(1, 2)
+#
+# 3. K/V 확장 - repeat_interleave:
+#    2그룹 → 12헤드로 복제
+#    keys = keys_base.repeat_interleave(self.group_size, dim=1)
+#    Before: [K1, K2]
+#    After:  [K1, K1, K1, K1, K1, K1, K2, K2, K2, K2, K2, K2]
+#
+# ============================================
+# 메모리 절약 효과
+# ============================================
+# | 항목             | MHA (12헤드)  | GQA (2그룹)  | 절약률 |
+# |------------------|---------------|--------------|--------|
+# | W_key 파라미터   | 768 × 768     | 768 × 128    | 83%    |
+# | W_value 파라미터 | 768 × 768     | 768 × 128    | 83%    |
+# | KV 캐시 크기     | 12 × seq × 64 | 2 × seq × 64 | 83%    |
+#
+# ============================================
+# 시각화
+# ============================================
+# 입력(768)
+#     │
+#     ├─→ W_query(768→768) → Q: 12헤드 × 64dim
+#     │
+#     ├─→ W_key(768→128)   → K: 2그룹 × 64dim ─→ repeat ─→ 12헤드
+#     │
+#     └─→ W_value(768→128) → V: 2그룹 × 64dim ─→ repeat ─→ 12헤드
+#
+# ============================================
+# 사용처
+# ============================================
+# - Llama 2 (70B): 8 KV 그룹
+# - Mistral 7B: 8 KV 그룹
+# - Gemma: 다양한 그룹 설정
+#
+# GQA는 MHA의 품질을 거의 유지하면서 KV 캐시를 크게 줄여,
+# 긴 시퀀스 처리에 효과적입니다.
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(
             self, d_in, d_out, dropout, num_heads, num_kv_groups, dtype=None, qkv_bias=False
@@ -28,11 +96,12 @@ class GroupedQueryAttention(nn.Module):
         self.d_out = d_out
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
-
+        #그룹수만큼 생
         self.W_key = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=qkv_bias, dtype=dtype)
         self.W_value = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=qkv_bias, dtype=dtype)
         self.num_kv_groups = num_kv_groups
-        self.group_size = num_heads // num_kv_groups
+        self.group_size = num_heads // num_kv_groups  # 각 K/V가 담당하는 Q 헤드 수
+                                                      # 예: num_heads=12, num_kv_groups=2 → group_size=6
 
         self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias, dtype=dtype)
         self.out_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
@@ -51,7 +120,9 @@ class GroupedQueryAttention(nn.Module):
         values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
 
         # Reshape
+        # Query: 전체 헤드 수 유지
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        # Key/Value: 그룹 수만큼만
         keys_new = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
         values_new = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
 
@@ -70,6 +141,48 @@ class GroupedQueryAttention(nn.Module):
 
         # Expand keys and values to match the number of heads
         # Shape: (b, num_heads, num_tokens, head_dim)
+        # K/V를 Query 헤드 수에 맞게 복제
+        # Before: [K1, K2]           (2 groups)
+        # After:  [K1, K1, K1, K1, K1, K1, K2, K2, K2, K2, K2, K2]  (12 heads)
+        #         └── group_size=6 ──┘
+        # 메모리 절약 효과
+        # 항목	MHA (12 헤드)	GQA (2 그룹)	절약
+        # K 프로젝션 파라미터	768 × 768	768 × 128	83%
+        # V 프로젝션 파라미터	768 × 768	768 × 128	83%
+        # KV 캐시 크기	12 × seq × 64	2 × seq × 64	83%
+        # emb_dim = 768        # 입력 차원 (d_in)
+        # num_heads = 12       # 전체 헤드 수
+        # head_dim = 768 // 12 = 64  # 헤드당 차원
+        # MHA (Multi-Head Attention)
+
+        # # 모든 헤드에 대해 K/V 생성
+        # self.W_key = nn.Linear(d_in, d_out)
+        # #                      768   768
+        # #                       ↓     ↓
+        # #                      입력   출력 = num_heads × head_dim
+        # #                             출력 = 12 × 64 = 768
+        # 파라미터 수: 768 × 768 = 589,824
+
+        # GQA (2 그룹)
+
+        # # 그룹 수만큼만 K/V 생성
+        # self.W_key = nn.Linear(d_in, num_kv_groups * head_dim)
+        # #                      768   2 × 64 = 128
+        # 파라미터 수: 768 × 128 = 98,304
+
+        # 시각화
+        # MHA (12헤드):
+        # 입력(768) → W_key → 출력(768) → reshape → (12 heads, 64 dim)
+        #                     ├─ K1 (64)
+        #                     ├─ K2 (64)
+        #                     ├─ K3 (64)
+        #                     ├─ ...
+        #                     └─ K12 (64)
+
+        # GQA (2그룹):
+        # 입력(768) → W_key → 출력(128) → reshape → (2 groups, 64 dim)
+        #                     ├─ K1 (64) → 복제 → Q1~Q6가 공유
+        #                     └─ K2 (64) → 복제 → Q7~Q12가 공유
         keys = keys_base.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values_base.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
         # For example, before repeat_interleave along dim=1 (query groups):
@@ -100,8 +213,9 @@ class GroupedQueryAttention(nn.Module):
             q_positions = torch.arange(num_tokens_Q, device=device, dtype=torch.long)
             self.ptr_current_pos = 0
         k_positions = torch.arange(num_tokens_K, device=device, dtype=torch.long)
+        # Broadcasting으로 마스크 생성
         mask = q_positions.unsqueeze(-1) < k_positions.unsqueeze(0)
-
+        # [[4]] < [[0,1,2,3,4]] → [[False, False, False, False, False]]
         # Use the mask to fill attention scores
         attn_scores = attn_scores.masked_fill(mask, -torch.inf)
 
