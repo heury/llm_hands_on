@@ -11,7 +11,6 @@
   - TransformerBlock, GPT의 구조
 - [Chapter_5_Excercise_Pretraining.ipynb](Chapter_5_Excercise_Pretraining.ipynb)
   - Cross Entropy, 모델 학습과정
-- [Chapter_5_Excercise_Pretraining_Cross_Entropy.ipynb](Chapter_5_Excercise_Pretraining_Cross_Entropy.ipynb)
 - [Chapter_6_Excercise_Finetuning_Classification.ipynb](Chapter_6_Excercise_Finetuning_Classification.ipynb)
 - [Chapter_6_Excercise_Finetuning_Classification_LoRA.ipynb](Chapter_6_Excercise_Finetuning_Classification_LoRA.ipynb)
   - LoRALayer만드는 방법과 Linear Layer에 LoRA를 적용하는 방법
@@ -21,6 +20,7 @@
 ## llm visualiazion
 
 - [https://bbycroft.net/llm](https://bbycroft.net/llm)
+- [Transformer Explainer](https://poloclub.github.io/transformer-explainer/)
 
 ## 코드 참고
 - 실습 코드는 아래 코드를 참고하여 제작하였습니다.
