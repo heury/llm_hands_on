@@ -18,6 +18,10 @@
 - [Chapter_7_Exercise_Follow_Instructions.ipynb](Chapter_7_Exercise_Follow_Instructions.ipynb)
 - [Chapter_7_Exercise_Follow_Instructions_dpo.ipynb](Chapter_7_Exercise_Follow_Instructions_dpo.ipynb)
 
+## llm visualiazion
+
+- [https://bbycroft.net/llm](https://bbycroft.net/llm)
+
 ## 코드 참고
 - 실습 코드는 아래 코드를 참고하여 제작하였습니다.
   - LLMs from scratch
